@@ -27,15 +27,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Generate RSS
-        run: python journal9.py --output data/journal9.xml
+        run: python3 journal9.py
 
       - name: Commit changes
         run: |
           if [[ -n "$(git status --porcelain)" ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/journal9.xml data/journal9_history.json || true
-            git commit -m "chore: update journal9 feed"
+            git add data/*.xml data/*history.json || true
+            git commit -m "chore: update mirrored feeds"
             git push
           else
             echo "No changes to commit"

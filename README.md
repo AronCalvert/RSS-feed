@@ -1,6 +1,12 @@
-# Journal.ie 9-at-9 Mirror
+# Feed Mirrors (Journal.ie + Red Network)
 
-Small helper script that grabs TheJournal.ie's daily **9-at-9** bulletin and regenerates it into a custom RSS feed you can self-host or plug into a reader that expects a regular RSS endpoint.
+Helper script + GitHub workflow that scrapes a few Irish left media sources and mirrors them into static RSS feeds you can host yourself (or via GitHub Pages). Each feed keeps a JSON cache so we can retain older entries and avoid duplicates.
+
+| Slug           | Source URL                            | Output file             |
+| -------------- | ------------------------------------- | ----------------------- |
+| `journal9`     | https://www.thejournal.ie/topic/9-at-9/ | `data/journal9.xml`     |
+| `red_articles` | https://rednetwork.net/articles/      | `data/red_articles.xml` |
+| `red_theory`   | https://rednetwork.net/red-theory/    | `data/red_theory.xml`   |
 
 ## Setup
 
@@ -13,40 +19,40 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python journal9.py --output data/journal9.xml
+python3 journal9.py                    # refresh every feed
+python3 journal9.py --source red_theory
+python3 journal9.py --dry-run --source journal9
+python3 journal9.py --list-sources
 ```
 
-Flags:
+Key flags:
 
-- `--feed-url` (default `https://www.thejournal.ie/topic/9-at-9/feed/`) to point at a different topic feed.
-- `--history` path for the JSON cache that prevents duplicate entries.
-- `--output` path for the generated RSS feed file.
-- `--max-items` number of mirrored items to keep (default 30).
-- `--dry-run` prints the RSS payload to stdout for quick inspection.
+- `--source <slug>` (repeatable) limits the run to specific feeds; defaults to all.
+- `--max-items <n>` overrides the per-feed history length for this run.
+- `--dry-run` prints the generated XML instead of writing files/saving history.
+- `--list-sources` shows the available slugs and exits.
 
-The script keeps a small JSON history so reruns do not create duplicates and older entries remain available.
+All output XML + history JSON lives under `data/`.
 
 ## GitHub Pages + Actions Hosting
 
-1. **Fork/copy this repo** and enable GitHub Pages in *Settings → Pages*, selecting the `main` branch and `/data` folder. The generated feed will then be served from `https://<user>.github.io/<repo>/journal9.xml`.
-2. **Review `.github/workflows/journal9.yml`:**
-   - Runs daily at 09:15 UTC (`cron: 15 9 * * *`). Adjust to your timezone.
-   - Installs dependencies, runs the scraper, and commits updated `data/journal9.xml` + `data/journal9_history.json`.
-   - Uses the default `GITHUB_TOKEN` with `contents: write` permission, so no personal token is required.
-3. **Optional secrets:** if you need to call authenticated APIs later, add them under *Settings → Secrets and variables → Actions* and reference them in the workflow.
-4. **Kick off a manual run** via the *Actions* tab (`workflow_dispatch`) to generate the first live feed before sharing the Pages URL.
+1. Push the repo and enable GitHub Pages in *Settings → Pages*, choosing the `main` branch and `/data` folder. Every XML under `data/` will be reachable at `https://<user>.github.io/<repo>/data/<file>.xml`.
+2. `.github/workflows/journal9.yml` (legacy name) runs daily at 09:15 UTC and on manual dispatch. It installs deps, executes `python3 journal9.py`, and commits any changed XML/history files back with the default `GITHUB_TOKEN`.
+3. Kick off the workflow manually once so the feeds exist before sharing URLs with your reader (Inoreader, NetNewsWire, etc.).
+4. Share the Pages URLs (`.../journal9.xml`, `.../red_articles.xml`, `.../red_theory.xml`). Every workflow run keeps them fresh automatically.
 
-## Scheduling
+## Self-Hosted Scheduling
 
-Add a cron entry (for example, run every day at 8:00 a.m.):
+Prefer running it yourself? Drop a cron entry (example: every day at 09:05 local time):
 
 ```
-0 8 * * * /usr/bin/env bash -lc 'cd /home/you/path/to/RSS-feed && source .venv/bin/activate && python journal9.py --output /var/www/html/journal9.xml'
+5 9 * * * /usr/bin/env bash -lc 'cd /home/you/RSS-feed && source .venv/bin/activate && python3 journal9.py'
 ```
 
-Point the `--output` flag wherever your RSS host or static site expects the file to live.
+Point `data/` (or symlinked files) at whatever directory your web server exposes.
 
 ## Notes
 
-- The scraper prefers the official topic RSS feed and then fetches the linked article, so it is resilient to most site layout tweaks.
-- The generated RSS description bundles the article summary and an ordered list of the nine talking points so readers can preview everything without leaving their reader.*** End Patch
+- Journal.ie content is seeded from their official topic RSS feed and then we scrape the linked article to mirror the nine talking points.
+- Red Network sections lack RSS, so we scrape their grid pages, follow the latest post, and mirror the intro paragraphs from `.reader__content`.
+- The `<description>` HTML is entity-escaped to keep the XML simple; mainstream feed readers render it correctly.*** End Patch

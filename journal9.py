@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Utility script for scraping TheJournal.ie daily 9-at-9 article and mirroring it
-into a lightweight RSS feed that you can self-host.
+Scrape a set of news sources (Journal.ie 9-at-9 + Red Network sections) and mirror
+them into static RSS feeds that can be self-hosted or published via GitHub Pages.
 
 Typical usage:
-    python journal9.py --output data/journal9.xml
+    python journal9.py                       # refresh every feed
+    python journal9.py --source journal9     # refresh one feed
+    python journal9.py --dry-run             # print feeds without writing
 """
 from __future__ import annotations
 
@@ -16,20 +18,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_FEED_URL = "https://www.thejournal.ie/topic/9-at-9/feed/"
-DEFAULT_HISTORY_PATH = BASE_DIR / "data" / "journal9_history.json"
-DEFAULT_OUTPUT_PATH = BASE_DIR / "data" / "journal9.xml"
 USER_AGENT = (
-    "journal9-fetcher/1.0 "
+    "rss-feed-mirror/2.0 "
     "(https://github.com/your-handle; contact: you@example.com)"
 )
+JOURNAL_FEED_URL = "https://www.thejournal.ie/topic/9-at-9/feed/"
+REDNETWORK_BASE = "https://rednetwork.net"
 
 
 @dataclass
@@ -38,12 +41,51 @@ class Entry:
     link: str
     published: datetime
     summary: str
-    points: List[str]
+    content_html: str
+    author: Optional[str] = None
 
     @property
     def guid(self) -> str:
         digest = hashlib.sha1(self.link.encode("utf-8"), usedforsecurity=False)
         return digest.hexdigest()
+
+    def to_record(self) -> dict:
+        return {
+            "id": self.guid,
+            "title": self.title,
+            "link": self.link,
+            "published": self.published.isoformat(),
+            "summary": self.summary,
+            "content_html": self.content_html,
+            "author": self.author,
+        }
+
+    @classmethod
+    def from_record(cls, record: dict) -> "Entry":
+        return cls(
+            title=record["title"],
+            link=record["link"],
+            published=datetime.fromisoformat(record["published"]),
+            summary=record.get("summary", ""),
+            content_html=record.get("content_html", ""),
+            author=record.get("author"),
+        )
+
+
+@dataclass
+class FeedConfig:
+    slug: str
+    title: str
+    link: str
+    description: str
+    history_path: Path
+    output_path: Path
+    max_items: int
+    fetcher: Callable[[], Entry]
+
+
+def _clean_text(value: str) -> str:
+    return " ".join(value.split())
 
 
 def _match_tag(element: ET.Element, name: str) -> bool:
@@ -58,6 +100,48 @@ def _find_child(element: ET.Element, name: str) -> Optional[ET.Element]:
             return child
     return None
 
+
+def load_history(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+
+def save_history(path: Path, entries: Sequence[Entry]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [entry.to_record() for entry in entries]
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def render_rss(config: FeedConfig, entries: Sequence[Entry]) -> str:
+    rss = ET.Element("rss", attrib={"version": "2.0"})
+    channel = ET.SubElement(rss, "channel")
+    ET.SubElement(channel, "title").text = config.title
+    ET.SubElement(channel, "link").text = config.link
+    ET.SubElement(channel, "description").text = config.description
+    ET.SubElement(channel, "language").text = "en"
+
+    for entry in entries:
+        item = ET.SubElement(channel, "item")
+        ET.SubElement(item, "title").text = entry.title
+        ET.SubElement(item, "link").text = entry.link
+        ET.SubElement(item, "guid", attrib={"isPermaLink": "false"}).text = entry.guid
+        pub_date = entry.published.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+        ET.SubElement(item, "pubDate").text = pub_date
+        if entry.author:
+            ET.SubElement(item, "author").text = entry.author
+        description = entry.content_html or entry.summary
+        ET.SubElement(item, "description").text = description
+
+    return ET.tostring(rss, encoding="utf-8", xml_declaration=True).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Journal.ie helpers
+# ---------------------------------------------------------------------------
 
 def fetch_latest_topic_entry(feed_url: str) -> dict:
     resp = requests.get(feed_url, headers={"User-Agent": USER_AGENT}, timeout=30)
@@ -83,11 +167,7 @@ def fetch_latest_topic_entry(feed_url: str) -> dict:
     return {"title": title, "link": link, "published": published}
 
 
-def _clean_text(value: str) -> str:
-    return " ".join(value.split())
-
-
-def extract_article_points(article_html: str) -> tuple[str, List[str]]:
+def extract_journal_article(article_html: str) -> tuple[str, List[str]]:
     soup = BeautifulSoup(article_html, "html.parser")
 
     summary = ""
@@ -127,147 +207,206 @@ def extract_article_points(article_html: str) -> tuple[str, List[str]]:
     return summary, bullet_points[:9]
 
 
-def fetch_entry(feed_url: str) -> Entry:
-    meta = fetch_latest_topic_entry(feed_url)
+def format_journal_description(summary: str, points: Sequence[str]) -> str:
+    lines: List[str] = []
+    if summary:
+        lines.append(f"<p>{summary}</p>")
+    if points:
+        bullets = "".join(f"<li>{point}</li>" for point in points)
+        lines.append(f"<ol>{bullets}</ol>")
+    return "".join(lines)
+
+
+def fetch_journal_entry() -> Entry:
+    meta = fetch_latest_topic_entry(JOURNAL_FEED_URL)
     resp = requests.get(meta["link"], headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
-    summary, points = extract_article_points(resp.text)
+    summary, points = extract_journal_article(resp.text)
 
     return Entry(
         title=meta["title"],
         link=meta["link"],
         published=meta["published"],
         summary=summary,
-        points=points,
+        content_html=format_journal_description(summary, points),
     )
 
 
-def load_history(path: Path) -> List[dict]:
-    if not path.exists():
-        return []
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
+# ---------------------------------------------------------------------------
+# Red Network helpers
+# ---------------------------------------------------------------------------
+
+def parse_red_date(value: str) -> datetime:
+    dt = datetime.strptime(value, "%d %B %Y")
+    return dt.replace(tzinfo=ZoneInfo("Europe/Dublin"))
 
 
-def save_history(path: Path, entries: Iterable[Entry]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [
-        {
-            "id": entry.guid,
-            "title": entry.title,
-            "link": entry.link,
-            "published": entry.published.isoformat(),
-            "summary": entry.summary,
-            "points": entry.points,
-        }
-        for entry in entries
+def extract_red_article(article_html: str) -> tuple[str, List[str]]:
+    soup = BeautifulSoup(article_html, "html.parser")
+    summary = ""
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    if meta_desc and meta_desc.get("content"):
+        summary = meta_desc["content"].strip()
+    if not summary:
+        first_para = soup.select_one(".reader__content p")
+        if first_para:
+            summary = _clean_text(first_para.get_text(" ", strip=True))
+
+    paragraphs = [
+        _clean_text(p.get_text(" ", strip=True))
+        for p in soup.select(".reader__content p")
+        if p.get_text(strip=True)
     ]
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return summary, paragraphs[:15]
 
 
-def render_description(entry: Entry) -> str:
-    lines = []
-    if entry.summary:
-        lines.append(f"<p>{entry.summary}</p>")
-    if entry.points:
-        bullets = "".join(f"<li>{point}</li>" for point in entry.points)
-        lines.append(f"<ol>{bullets}</ol>")
+def format_red_description(summary: str, paragraphs: Sequence[str]) -> str:
+    lines: List[str] = []
+    if summary:
+        lines.append(f"<p>{summary}</p>")
+    for para in paragraphs:
+        lines.append(f"<p>{para}</p>")
     return "".join(lines)
 
 
-def render_rss(entries: Iterable[Entry]) -> str:
-    rss = ET.Element("rss", attrib={"version": "2.0"})
-    channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = "Journal.ie – Daily 9-at-9 Mirror"
-    ET.SubElement(channel, "link").text = "https://www.thejournal.ie/topic/9-at-9/"
-    ET.SubElement(channel, "description").text = (
-        "Locally mirrored feed of TheJournal.ie Daily 9-at-9 bulletins."
+def fetch_rednetwork_entry(section_slug: str, section_name: str) -> Entry:
+    listing_url = f"{REDNETWORK_BASE}/{section_slug.strip('/')}/"
+    resp = requests.get(listing_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    card = soup.select_one(".articles__grid a.article-link")
+    if card is None:
+        raise RuntimeError(f"No articles found for {section_name}")
+
+    link = urljoin(REDNETWORK_BASE, card.get("href", ""))
+    title_node = card.select_one(".headline")
+    author_node = card.select_one(".author")
+    date_node = card.select_one(".date")
+
+    title = _clean_text(title_node.get_text(" ", strip=True)) if title_node else card.get("href", "")
+    author = _clean_text(author_node.get_text(" ", strip=True)) if author_node else None
+    date_text = _clean_text(date_node.get_text(" ", strip=True)) if date_node else ""
+    published = parse_red_date(date_text) if date_text else datetime.now(timezone.utc)
+
+    article_resp = requests.get(link, headers={"User-Agent": USER_AGENT}, timeout=30)
+    article_resp.raise_for_status()
+    summary, paragraphs = extract_red_article(article_resp.text)
+
+    return Entry(
+        title=title,
+        link=link,
+        author=author,
+        published=published,
+        summary=summary,
+        content_html=format_red_description(summary, paragraphs),
     )
-    ET.SubElement(channel, "language").text = "en"
-
-    for entry in entries:
-        item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = entry.title
-        ET.SubElement(item, "link").text = entry.link
-        ET.SubElement(item, "guid", attrib={"isPermaLink": "false"}).text = entry.guid
-        pub_date = entry.published.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
-        ET.SubElement(item, "pubDate").text = pub_date
-        ET.SubElement(item, "description").text = render_description(entry)
-
-    return ET.tostring(rss, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Mirror TheJournal.ie 9-at-9 into a custom RSS feed.")
-    parser.add_argument("--feed-url", default=DEFAULT_FEED_URL, help="Topic feed to follow.")
+# ---------------------------------------------------------------------------
+# Feed runner
+# ---------------------------------------------------------------------------
+
+def build_feed_configs() -> Dict[str, FeedConfig]:
+    data_dir = BASE_DIR / "data"
+    return {
+        "journal9": FeedConfig(
+            slug="journal9",
+            title="Journal.ie – Daily 9-at-9 Mirror",
+            link="https://www.thejournal.ie/topic/9-at-9/",
+            description="Locally mirrored feed of TheJournal.ie Daily 9-at-9 bulletins.",
+            history_path=data_dir / "journal9_history.json",
+            output_path=data_dir / "journal9.xml",
+            max_items=30,
+            fetcher=fetch_journal_entry,
+        ),
+        "red_articles": FeedConfig(
+            slug="red_articles",
+            title="Red Network – Articles",
+            link=f"{REDNETWORK_BASE}/articles/",
+            description="Mirror of the main Red Network articles section.",
+            history_path=data_dir / "red_articles_history.json",
+            output_path=data_dir / "red_articles.xml",
+            max_items=30,
+            fetcher=lambda: fetch_rednetwork_entry("articles", "Articles"),
+        ),
+        "red_theory": FeedConfig(
+            slug="red_theory",
+            title="Red Network – Red Theory",
+            link=f"{REDNETWORK_BASE}/red-theory/",
+            description="Mirror of the Red Theory long-form pieces.",
+            history_path=data_dir / "red_theory_history.json",
+            output_path=data_dir / "red_theory.xml",
+            max_items=30,
+            fetcher=lambda: fetch_rednetwork_entry("red-theory", "Red Theory"),
+        ),
+    }
+
+
+def mirror_feed(config: FeedConfig, max_items_override: Optional[int], dry_run: bool) -> None:
+    latest_entry = config.fetcher()
+    history_records = load_history(config.history_path)
+    entries_by_id = {record["id"]: record for record in history_records}
+
+    if latest_entry.guid not in entries_by_id:
+        print(f"[{config.slug}] Adding new entry: {latest_entry.title}")
+        history_records.insert(0, latest_entry.to_record())
+    else:
+        print(f"[{config.slug}] Latest entry already mirrored; keeping history order.")
+
+    limit = max_items_override or config.max_items
+    trimmed = history_records[:limit]
+    entries = [Entry.from_record(record) for record in trimmed]
+    rss_payload = render_rss(config, entries)
+
+    if dry_run:
+        print(f"\n--- {config.slug} ---")
+        print(rss_payload)
+        return
+
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    config.output_path.write_text(rss_payload, encoding="utf-8")
+    save_history(config.history_path, entries)
+    print(f"[{config.slug}] Wrote RSS feed to {config.output_path}")
+
+
+def parse_args(configs: Dict[str, FeedConfig]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Mirror multiple sources into local RSS feeds.")
     parser.add_argument(
-        "--history",
-        default=str(DEFAULT_HISTORY_PATH),
-        help="JSON file used to deduplicate already mirrored entries.",
+        "--source",
+        action="append",
+        choices=sorted(configs.keys()),
+        help="Limit to one or more feed slugs. Defaults to all.",
     )
     parser.add_argument(
-        "--output",
-        default=str(DEFAULT_OUTPUT_PATH),
-        help="Path to write the generated RSS feed.",
+        "--max-items",
+        type=int,
+        help="Override the default max history length for every feed run.",
     )
-    parser.add_argument("--max-items", type=int, default=30, help="Maximum entries to keep.")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the generated RSS instead of writing to disk.",
+        help="Print generated RSS instead of writing files/saving history.",
+    )
+    parser.add_argument(
+        "--list-sources",
+        action="store_true",
+        help="Show available feed slugs and exit.",
     )
     return parser.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
-    history_path = Path(args.history)
-    output_path = Path(args.output)
+    configs = build_feed_configs()
+    args = parse_args(configs)
 
-    latest_entry = fetch_entry(args.feed_url)
+    if args.list_sources:
+        for slug, cfg in configs.items():
+            print(f"{slug:12} -> {cfg.title}")
+        return 0
 
-    history_records = load_history(history_path)
-    entries_by_id = {record["id"]: record for record in history_records}
-
-    if latest_entry.guid not in entries_by_id:
-        print(f"Adding new entry for {latest_entry.title}")
-        history_records.insert(
-            0,
-            {
-                "id": latest_entry.guid,
-                "title": latest_entry.title,
-                "link": latest_entry.link,
-                "published": latest_entry.published.isoformat(),
-                "summary": latest_entry.summary,
-                "points": latest_entry.points,
-            },
-        )
-    else:
-        print("Latest entry already mirrored; refreshing timestamps.")
-
-    trimmed = history_records[: args.max_items]
-    entries = [
-        Entry(
-            title=record["title"],
-            link=record["link"],
-            published=datetime.fromisoformat(record["published"]),
-            summary=record.get("summary", ""),
-            points=record.get("points", []),
-        )
-        for record in trimmed
-    ]
-
-    rss_payload = render_rss(entries)
-
-    if args.dry_run:
-        print(rss_payload)
-    else:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rss_payload, encoding="utf-8")
-        save_history(history_path, entries)
-        print(f"Wrote RSS feed to {output_path}")
+    selected = args.source or sorted(configs.keys())
+    for slug in selected:
+        mirror_feed(configs[slug], args.max_items, args.dry_run)
     return 0
 
 
