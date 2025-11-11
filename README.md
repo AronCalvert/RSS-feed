@@ -7,6 +7,7 @@ Helper script + GitHub workflow that scrapes a few Irish left media sources and 
 | `journal9`     | https://www.thejournal.ie/topic/9-at-9/ | `data/journal9.xml`     |
 | `red_articles` | https://rednetwork.net/articles/      | `data/red_articles.xml` |
 | `red_theory`   | https://rednetwork.net/red-theory/    | `data/red_theory.xml`   |
+| `imr_issue`    | https://irishmarxistreview.net/index.php/imr | `data/imr_issue.xml`    |
 
 ## Setup
 
@@ -55,4 +56,5 @@ Point `data/` (or symlinked files) at whatever directory your web server exposes
 
 - Journal.ie content is seeded from their official topic RSS feed and then we scrape the linked article to mirror the nine talking points.
 - Red Network sections lack RSS, so we scrape their grid pages, follow the latest post, and mirror the intro paragraphs from `.reader__content`.
+- Irish Marxist Review already exposes article-level RSS, but we scrape the homepage “Current Issue” block so you get one tidy notification per new issue (cover, date, contents).
 - The `<description>` HTML is entity-escaped to keep the XML simple; mainstream feed readers render it correctly.*** End Patch

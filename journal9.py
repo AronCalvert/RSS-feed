@@ -17,6 +17,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from html import escape
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urljoin
@@ -33,6 +34,7 @@ USER_AGENT = (
 )
 JOURNAL_FEED_URL = "https://www.thejournal.ie/topic/9-at-9/feed/"
 REDNETWORK_BASE = "https://rednetwork.net"
+IMR_BASE_URL = "https://irishmarxistreview.net/index.php/imr"
 
 
 @dataclass
@@ -303,6 +305,109 @@ def fetch_rednetwork_entry(section_slug: str, section_name: str) -> Entry:
 
 
 # ---------------------------------------------------------------------------
+# Irish Marxist Review helpers
+# ---------------------------------------------------------------------------
+
+def parse_imr_issue_date(value: str) -> datetime:
+    cleaned = value.strip()
+    for fmt in ("%Y-%m-%d", "%d %B %Y"):
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            return dt.replace(tzinfo=ZoneInfo("Europe/Dublin"))
+        except ValueError:
+            continue
+    return datetime.now(timezone.utc)
+
+
+def _format_imr_sections(section_nodes: Iterable) -> str:
+    blocks: List[str] = []
+    for section in section_nodes:
+        heading_node = section.find("h3")
+        heading_text = _clean_text(heading_node.get_text(" ", strip=True)) if heading_node else ""
+        articles = section.select(".obj_article_summary")
+        if not articles:
+            continue
+        if heading_text:
+            blocks.append(f"<h4>{escape(heading_text)}</h4>")
+        blocks.append("<ul>")
+        for article in articles:
+            link_node = article.select_one("h4 a")
+            href = urljoin(IMR_BASE_URL, link_node.get("href", "")) if link_node and link_node.get("href") else None
+            title_text = _clean_text(link_node.get_text(" ", strip=True)) if link_node else ""
+            authors_node = article.select_one(".meta .authors")
+            authors_text = _clean_text(authors_node.get_text(" ", strip=True)) if authors_node else ""
+            if not title_text:
+                continue
+            if href:
+                href_attr = escape(href, quote=True)
+                title_html = escape(title_text)
+                line = f'<li><a href="{href_attr}">{title_html}</a>'
+            else:
+                line = f"<li>{escape(title_text)}"
+            if authors_text:
+                line += f" – {escape(authors_text)}"
+            line += "</li>"
+            blocks.append(line)
+        blocks.append("</ul>")
+    return "".join(blocks)
+
+
+def fetch_imr_issue_entry() -> Entry:
+    resp = requests.get(IMR_BASE_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    current_section = soup.select_one("section.current_issue")
+    if current_section is None:
+        raise RuntimeError("IMR homepage did not include the current issue block")
+
+    title_node = current_section.select_one(".current_issue_title")
+    issue_title = (
+        _clean_text(title_node.get_text(" ", strip=True)) if title_node else "Irish Marxist Review – Latest Issue"
+    )
+
+    cover_link = current_section.select_one(".obj_issue_toc .heading a.cover")
+    issue_link = IMR_BASE_URL
+    if cover_link and cover_link.get("href"):
+        issue_link = urljoin(IMR_BASE_URL, cover_link.get("href"))
+
+    cover_img = cover_link.find("img") if cover_link else None
+    cover_src = urljoin(IMR_BASE_URL, cover_img.get("src", "")) if cover_img and cover_img.get("src") else None
+    cover_alt = _clean_text(cover_img.get("alt", issue_title)) if cover_img else issue_title
+
+    published_node = current_section.select_one(".published .value")
+    published_text = _clean_text(published_node.get_text(" ", strip=True)) if published_node else ""
+    published = parse_imr_issue_date(published_text) if published_text else datetime.now(timezone.utc)
+
+    content_parts: List[str] = []
+    if cover_src:
+        issue_link_attr = escape(issue_link, quote=True)
+        cover_src_attr = escape(cover_src, quote=True)
+        cover_alt_attr = escape(cover_alt, quote=True)
+        content_parts.append(
+            f'<p><a href="{issue_link_attr}"><img src="{cover_src_attr}" alt="{cover_alt_attr}"></a></p>'
+        )
+    content_parts.append(f"<p>{escape(issue_title)}</p>")
+    if published_text:
+        content_parts.append(f"<p><strong>Published:</strong> {escape(published_text)}</p>")
+
+    sections_container = current_section.select_one(".sections")
+    if sections_container:
+        sections_html = _format_imr_sections(sections_container.select(".section"))
+        if sections_html:
+            content_parts.append(sections_html)
+
+    content_html = "".join(content_parts) if content_parts else issue_title
+
+    return Entry(
+        title=issue_title,
+        link=issue_link,
+        published=published,
+        summary=issue_title,
+        content_html=content_html,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Feed runner
 # ---------------------------------------------------------------------------
 
@@ -338,6 +443,16 @@ def build_feed_configs() -> Dict[str, FeedConfig]:
             output_path=data_dir / "red_theory.xml",
             max_items=30,
             fetcher=lambda: fetch_rednetwork_entry("red-theory", "Red Theory"),
+        ),
+        "imr_issue": FeedConfig(
+            slug="imr_issue",
+            title="Irish Marxist Review – Issues",
+            link=f"{IMR_BASE_URL}/issue/current",
+            description="Notifies when a new Irish Marxist Review issue is published.",
+            history_path=data_dir / "imr_issue_history.json",
+            output_path=data_dir / "imr_issue.xml",
+            max_items=12,
+            fetcher=fetch_imr_issue_entry,
         ),
     }
 
